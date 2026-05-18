@@ -26,6 +26,7 @@ use crate::{
     daemon_connection::{DaemonChannel, node_integration_testing::convert_output_to_json},
     event_stream::data_conversion::RawData,
 };
+use aligned_vec::{AVec, ConstAlign};
 use dora_core::{
     config::{Input, NodeId},
     uhlc,
@@ -1110,26 +1111,31 @@ fn zenoh_payload_to_arrow_array(
             // SHM path: the slice points into memory owned by `payload`
             // (the zenoh shared-memory mapping).
             //
-            // Zenoh's Talc sub-allocator does not honour the AllocAlignment
-            // hint on all platforms (observed: only 16-byte aligned on
-            // Jetson NX / L4T). aarch64 NEON SIMD instructions (e.g. those
-            // emitted for Arrow compute kernels) require the buffer base
-            // address to be 64-byte aligned; a misaligned base causes SIGBUS
-            // on NVIDIA Carmel cores even though the individual Arrow buffer
-            // *offsets* within the payload are already 64-byte aligned.
+            // Zenoh's Talc sub-allocator does not always honour the
+            // AllocAlignment hint (observed: only 16-byte aligned on
+            // Jetson NX / L4T). aarch64 NEON SIMD instructions used by Arrow
+            // compute kernels require the buffer base address to be 64-byte
+            // aligned; a misaligned base causes SIGBUS on NVIDIA Carmel cores
+            // even though the individual Arrow buffer *offsets* within the
+            // payload are already 64-byte aligned (see `arrow_utils::ARROW_SHM_ALIGNMENT`).
             //
-            // Defence: check alignment here and fall back to a heap copy when
-            // the SHM base is not 64-byte aligned. The copy is O(payload)
-            // but only occurs when the platform's SHM allocator misbehaves.
+            // Defence: check alignment here and fall back to a heap copy
+            // into a 64-byte-aligned `AVec` when the SHM base is misaligned.
+            // The copy is O(payload) but only occurs when the platform's SHM
+            // allocator misbehaves; on well-behaved platforms the zero-copy
+            // path is taken.
             const REQUIRED_ALIGN: usize = 64;
-            if slice.as_ptr() as usize % REQUIRED_ALIGN == 0 {
-                // Already aligned: true zero-copy SHM path.
-                let ptr = NonNull::new(slice.as_ptr() as *mut u8)
-                    .expect("zenoh SHM payload ptr is null");
+            if (slice.as_ptr() as usize).is_multiple_of(REQUIRED_ALIGN) {
+                // Zero-copy SHM path: wrap `payload` (which owns the SHM
+                // mapping) in an Arc as the allocation owner so the mapping
+                // stays alive for the lifetime of the Arrow buffer.
+                let ptr =
+                    NonNull::new(slice.as_ptr() as *mut u8).expect("zenoh SHM payload ptr is null");
                 let len = slice.len();
 
-                // Newtype satisfying arrow's Allocation trait.
-                #[allow(dead_code)] // field kept alive to own the zenoh buffer
+                // Newtype satisfying arrow's `Allocation` trait. The field
+                // is kept alive to own the zenoh buffer.
+                #[allow(dead_code)]
                 struct ZBytesAllocation(zenoh::bytes::ZBytes);
                 unsafe impl Sync for ZBytesAllocation {}
                 unsafe impl Send for ZBytesAllocation {}
@@ -1146,31 +1152,26 @@ fn zenoh_payload_to_arrow_array(
                     )
                 }
             } else {
-                // Misaligned SHM pointer (Talc ignores AllocAlignment on
-                // some platforms, e.g. Jetson NX L4T).  Copy into a
-                // 128-byte-aligned heap buffer so that every Arrow buffer
-                // within the payload (whose intra-payload offsets are
-                // already multiples of 64) ends up at an absolute address
-                // that is also 64-byte aligned.
-                let mut aligned: Vec<u8> = Vec::with_capacity(slice.len() + REQUIRED_ALIGN);
-                // Push padding so the data starts at a 64-byte boundary.
-                let base = aligned.as_ptr() as usize;
-                let pad = REQUIRED_ALIGN - (base % REQUIRED_ALIGN);
-                let pad = if pad == REQUIRED_ALIGN { 0 } else { pad };
-                aligned.resize(pad, 0);
-                aligned.extend_from_slice(slice);
-                // Slice off the padding so the Arrow Buffer starts at the
-                // aligned address.
-                let aligned_slice = &aligned[pad..];
-                // We must not move `aligned` while the slice exists, so we
-                // use from_custom_allocation with an Arc<Vec<u8>>.
-                let ptr = NonNull::new(aligned_slice.as_ptr() as *mut u8)
-                    .expect("aligned copy ptr is null");
-                let len = aligned_slice.len();
-                let owner = Arc::new(aligned);
-                // SAFETY: `ptr` is derived from `owner` (the Vec).  The Arc
-                // keeps the Vec alive for the lifetime of the Buffer.
-                unsafe { arrow::buffer::Buffer::from_custom_allocation(ptr, len, owner) }
+                // Misaligned SHM pointer (Talc ignored AllocAlignment on
+                // this platform, e.g. Jetson NX L4T). Copy into a 64-byte
+                // aligned `AVec` so the absolute address of every Arrow
+                // buffer (base + intra-payload offset, already a multiple
+                // of 64) is also 64-byte aligned.
+                tracing::warn!(
+                    payload_len = slice.len(),
+                    base_addr_mod_64 = slice.as_ptr() as usize % REQUIRED_ALIGN,
+                    "zenoh SHM payload not 64-byte aligned; falling back to heap copy",
+                );
+                let aligned: AVec<u8, ConstAlign<REQUIRED_ALIGN>> =
+                    AVec::from_slice(REQUIRED_ALIGN, slice);
+                let ptr = NonNull::new(aligned.as_ptr() as *mut u8).expect("AVec ptr is null");
+                let len = aligned.len();
+                // SAFETY: `ptr` is derived from `aligned` (the AVec). The Arc
+                // keeps the AVec alive for the lifetime of the Buffer, and
+                // `AVec<u8, ConstAlign<64>>` guarantees `ptr` is 64-byte aligned.
+                unsafe {
+                    arrow::buffer::Buffer::from_custom_allocation(ptr, len, Arc::new(aligned))
+                }
             }
         }
         std::borrow::Cow::Owned(vec) => {
