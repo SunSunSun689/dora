@@ -27,6 +27,12 @@ const LOCAL_DORA_WHEEL_CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 6
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x00000100000001b3;
 
+fn resolve_env_value(key: &str, value: &EnvValue) -> eyre::Result<String> {
+    value
+        .resolve_env()
+        .wrap_err_with(|| format!("failed to resolve environment variable `{key}`"))
+}
+
 #[derive(Debug)]
 struct LocalDoraPythonSource {
     package_dir: PathBuf,
@@ -73,7 +79,7 @@ pub async fn run_build_command(
         // Inject Environment Variables
         if let Some(envs) = envs {
             for (key, value) in envs {
-                let value = value.to_string();
+                let value = resolve_env_value(key, value)?;
                 cmd.env(key, value);
             }
         }
@@ -157,7 +163,8 @@ fn managed_python_path(
     let base_path = envs
         .as_ref()
         .and_then(|envs| envs.get("PATH"))
-        .map(|value| OsString::from(value.to_string()))
+        .map(|value| resolve_env_value("PATH", value).map(OsString::from))
+        .transpose()?
         .or_else(|| std::env::var_os("PATH"));
 
     if let Some(base_path) = base_path {
@@ -192,7 +199,7 @@ pub async fn prepare_managed_python_env(
 
         if let Some(envs) = envs {
             for (key, value) in envs {
-                cmd.env(key, value.to_string());
+                cmd.env(key, resolve_env_value(key, value)?);
             }
         }
 
@@ -269,7 +276,7 @@ async fn ensure_managed_python_runtime(
 
     if let Some(envs) = envs {
         for (key, value) in envs {
-            cmd.env(key, value.to_string());
+            cmd.env(key, resolve_env_value(key, value)?);
         }
     }
     apply_managed_python_env(&mut cmd, python_env_dir, envs)
@@ -473,7 +480,7 @@ async fn ensure_local_dora_python_wheel(
 
     if let Some(envs) = envs {
         for (key, value) in envs {
-            cmd.env(key, value.to_string());
+            cmd.env(key, resolve_env_value(key, value)?);
         }
     }
     cmd.current_dir(dunce::simplified(&source.package_dir));

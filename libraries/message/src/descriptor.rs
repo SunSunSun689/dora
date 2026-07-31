@@ -1160,6 +1160,13 @@ pub enum GitRepoRev {
 
 #[allow(missing_docs)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostEnvValue {
+    pub __dora_env: String,
+}
+
+#[allow(missing_docs)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum EnvValue {
     #[serde(deserialize_with = "with_expand_envs")]
@@ -1170,6 +1177,7 @@ pub enum EnvValue {
     Float(f64),
     #[serde(deserialize_with = "with_expand_envs")]
     String(String),
+    HostEnv(HostEnvValue),
 }
 
 impl fmt::Display for EnvValue {
@@ -1179,6 +1187,22 @@ impl fmt::Display for EnvValue {
             EnvValue::Integer(i64) => fmt.write_str(&i64.to_string()),
             EnvValue::Float(f64) => fmt.write_str(&f64.to_string()),
             EnvValue::String(str) => fmt.write_str(str),
+            EnvValue::HostEnv(host_env) => {
+                fmt.write_str(&std::env::var(&host_env.__dora_env).unwrap_or_default())
+            }
+        }
+    }
+}
+
+impl EnvValue {
+    /// Resolve this descriptor value to the string that should be injected into a process environment.
+    pub fn resolve_env(&self) -> Result<String, std::env::VarError> {
+        match self {
+            EnvValue::Bool(bool) => Ok(bool.to_string()),
+            EnvValue::Integer(i64) => Ok(i64.to_string()),
+            EnvValue::Float(f64) => Ok(f64.to_string()),
+            EnvValue::String(str) => Ok(str.clone()),
+            EnvValue::HostEnv(host_env) => std::env::var(&host_env.__dora_env),
         }
     }
 }
@@ -1477,6 +1501,47 @@ nodes:
 "#;
         let desc: Descriptor = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(desc.nodes[0].cpu_affinity, None);
+    }
+
+    #[test]
+    fn env_value_parses_host_env_reference() {
+        let expected_path = std::env::var("PATH").expect("PATH is set in test environment");
+        let yaml = r#"
+nodes:
+  - id: test
+    path: test.py
+    env:
+      FROM_HOST:
+        __dora_env: PATH
+"#;
+        let desc: Descriptor = serde_yaml::from_str(yaml).unwrap();
+        let value = desc.nodes[0]
+            .env
+            .as_ref()
+            .and_then(|env| env.get("FROM_HOST"))
+            .expect("FROM_HOST env is parsed");
+
+        assert_eq!(value.resolve_env().unwrap(), expected_path);
+    }
+
+    #[test]
+    fn env_value_reports_missing_host_env_reference() {
+        let yaml = r#"
+nodes:
+  - id: test
+    path: test.py
+    env:
+      FROM_HOST:
+        __dora_env: __DORA_TEST_ENV_VALUE_THAT_SHOULD_NOT_EXIST
+"#;
+        let desc: Descriptor = serde_yaml::from_str(yaml).unwrap();
+        let value = desc.nodes[0]
+            .env
+            .as_ref()
+            .and_then(|env| env.get("FROM_HOST"))
+            .expect("FROM_HOST env is parsed");
+
+        assert!(value.resolve_env().is_err());
     }
 
     #[test]

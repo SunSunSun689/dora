@@ -67,6 +67,12 @@ fn strip_denied_env(mut command: Command) -> Command {
     command
 }
 
+fn resolve_env_value(key: &str, value: &EnvValue) -> eyre::Result<String> {
+    value
+        .resolve_env()
+        .wrap_err_with(|| format!("failed to resolve environment variable `{key}`"))
+}
+
 /// Point a spawned process at the managed Python env.
 ///
 /// Sets `VIRTUAL_ENV` and prepends the env's `bin/` (or `Scripts/` on
@@ -88,7 +94,8 @@ fn apply_managed_python_runtime_env(
 
     let base_path = node_env
         .and_then(|envs| envs.get("PATH"))
-        .map(|value| OsString::from(value.to_string()))
+        .map(|value| resolve_env_value("PATH", value).map(OsString::from))
+        .transpose()?
         .or_else(|| std::env::var_os("PATH"));
 
     let mut paths = vec![bin_dir];
@@ -417,7 +424,7 @@ impl Spawner {
                     if let Some(envs) = &node.env {
                         for (key, value) in envs {
                             if !is_denied_env(key) {
-                                command = command.env(key, value.to_string());
+                                command = command.env(key, resolve_env_value(key, value)?);
                             }
                         }
                     }
@@ -425,7 +432,7 @@ impl Spawner {
                         // node has some inner env variables -> add them too
                         for (key, value) in envs {
                             if !is_denied_env(key) {
-                                command = command.env(key, value.to_string());
+                                command = command.env(key, resolve_env_value(key, value)?);
                             }
                         }
                     }
@@ -624,7 +631,7 @@ impl Spawner {
                     if let Some(envs) = &node.env {
                         for (key, value) in envs {
                             if !is_denied_env(key) {
-                                command = command.env(key, value.to_string());
+                                command = command.env(key, resolve_env_value(key, value)?);
                             }
                         }
                     }

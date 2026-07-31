@@ -583,6 +583,7 @@ enum NodeKindMut<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dora_message::descriptor::HostEnvValue;
 
     fn env(pairs: &[(&str, &str)]) -> BTreeMap<String, EnvValue> {
         pairs
@@ -661,6 +662,56 @@ nodes:
         assert_eq!(
             b_env.get("OTEL_ENDPOINT"),
             Some(&EnvValue::String("http://collector:4317".into()))
+        );
+    }
+
+    #[test]
+    fn descriptor_global_host_env_is_inherited_by_nodes() {
+        let expected_path = std::env::var("PATH").expect("PATH is set in test environment");
+        let yaml = r#"
+env:
+  FROM_HOST:
+    __dora_env: PATH
+nodes:
+  - id: a
+    path: ./a
+"#;
+        let desc: Descriptor = serde_yaml::from_str(yaml).expect("parse");
+        let resolved = desc.resolve_aliases_and_set_defaults().expect("resolve");
+
+        let node = resolved.get(&NodeId::from("a".to_string())).unwrap();
+        let env = node.env.as_ref().expect("node inherits global env");
+        assert_eq!(
+            env.get("FROM_HOST")
+                .and_then(|value| value.resolve_env().ok()),
+            Some(expected_path)
+        );
+    }
+
+    #[test]
+    fn descriptor_node_host_env_overrides_global_env() {
+        let yaml = r#"
+env:
+  FROM_HOST: global
+nodes:
+  - id: a
+    path: ./a
+    env:
+      FROM_HOST:
+        __dora_env: PATH
+"#;
+        let desc: Descriptor = serde_yaml::from_str(yaml).expect("parse");
+        let resolved = desc.resolve_aliases_and_set_defaults().expect("resolve");
+
+        let node = resolved.get(&NodeId::from("a".to_string())).unwrap();
+        assert_eq!(
+            node.env
+                .as_ref()
+                .and_then(|env| env.get("FROM_HOST"))
+                .expect("node env is present"),
+            &EnvValue::HostEnv(HostEnvValue {
+                __dora_env: "PATH".to_string(),
+            })
         );
     }
 

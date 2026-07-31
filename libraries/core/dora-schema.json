@@ -282,6 +282,9 @@
         },
         {
           "type": "string"
+        },
+        {
+          "$ref": "#/$defs/HostEnvValue"
         }
       ]
     },
@@ -323,6 +326,18 @@
             "Rev"
           ]
         }
+      ]
+    },
+    "HostEnvValue": {
+      "type": "object",
+      "properties": {
+        "__dora_env": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "__dora_env"
       ]
     },
     "Input": {

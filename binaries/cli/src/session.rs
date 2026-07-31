@@ -751,6 +751,37 @@ nodes:
     }
 
     #[test]
+    fn fingerprint_changes_when_host_env_reference_changes() {
+        let path_env = resolved(
+            "\
+nodes:
+  - id: a
+    path: ./a
+    build: cargo build
+    env:
+      FROM_HOST:
+        __dora_env: PATH
+",
+        );
+        let home_env = resolved(
+            "\
+nodes:
+  - id: a
+    path: ./a
+    build: cargo build
+    env:
+      FROM_HOST:
+        __dora_env: HOME
+",
+        );
+        assert_ne!(
+            DataflowSession::fingerprint_build_inputs(&path_env),
+            DataflowSession::fingerprint_build_inputs(&home_env),
+            "host env reference values must contribute to the build fingerprint",
+        );
+    }
+
+    #[test]
     fn fingerprint_changes_when_env_key_removed() {
         let two_keys = resolved(
             "\
