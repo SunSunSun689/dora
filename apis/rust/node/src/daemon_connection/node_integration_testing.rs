@@ -30,8 +30,16 @@ use crate::{
     integration_testing::{TestingInput, TestingOptions, TestingOutput},
 };
 
+/// Where `IntegrationTestingEvents` draws its input events from.
+enum EventSource {
+    /// Pre-loaded event list (file-backed or in-memory).
+    Vec(std::vec::IntoIter<TimedIncomingEvent>),
+    /// Live channel for runtime injection (test harness pushes events).
+    Channel(tokio::sync::mpsc::Receiver<TimedIncomingEvent>),
+}
+
 pub struct IntegrationTestingEvents {
-    events: std::vec::IntoIter<TimedIncomingEvent>,
+    event_source: EventSource,
     output_writer: OutputWriter,
     start_timestamp: uhlc::Timestamp,
     start_time: Instant,
@@ -44,20 +52,51 @@ impl IntegrationTestingEvents {
         output: TestingOutput,
         options: TestingOptions,
     ) -> eyre::Result<Self> {
-        let mut node_info: IntegrationTestInput = match input {
-            TestingInput::FromJsonFile(input_file_path) => serde_json::from_slice(
-                &std::fs::read(&input_file_path)
-                    .with_context(|| format!("failed to open {}", input_file_path.display()))?,
-            )
-            .with_context(|| format!("failed to deserialize {}", input_file_path.display()))?,
-            TestingInput::Input(input) => input,
+        let event_source = match input {
+            TestingInput::FromJsonFile(input_file_path) => {
+                let node_info: IntegrationTestInput = serde_json::from_slice(
+                    &std::fs::read(&input_file_path)
+                        .with_context(|| format!("failed to open {}", input_file_path.display()))?,
+                )
+                .with_context(|| format!("failed to deserialize {}", input_file_path.display()))?;
+                Self::check_poisoned(&node_info)?;
+                let mut events = node_info.events;
+                events.sort_by(|a, b| a.time_offset_secs.total_cmp(&b.time_offset_secs));
+                EventSource::Vec(events.into_iter())
+            }
+            TestingInput::Input(node_info) => {
+                Self::check_poisoned(&node_info)?;
+                let mut events = node_info.events;
+                events.sort_by(|a, b| a.time_offset_secs.total_cmp(&b.time_offset_secs));
+                EventSource::Vec(events.into_iter())
+            }
+            TestingInput::Channel(rx) => EventSource::Channel(rx),
         };
 
-        // Refuse to replay poisoned recordings. The `events` array is
-        // known incomplete relative to the original run; loading it
-        // anyway would defeat the whole point of recording (#1857).
-        // Hand-authored fixtures and pre-#1857 recordings have
-        // `recording_status: None` and pass through cleanly.
+        let output_writer = match output {
+            TestingOutput::ToFile(output_file_path) => {
+                let file = File::create(&output_file_path)
+                    .with_context(|| format!("failed to create {}", output_file_path.display()))?;
+                OutputWriter::Writer(Box::new(file))
+            }
+            TestingOutput::ToWriter(writer) => OutputWriter::Writer(writer),
+            TestingOutput::ToChannel(sender) => OutputWriter::Channel(sender),
+        };
+
+        let clock = HLC::default();
+        let start_timestamp = clock.new_timestamp();
+        let start_time = Instant::now();
+        Ok(Self {
+            event_source,
+            output_writer,
+            start_timestamp,
+            start_time,
+            options,
+        })
+    }
+
+    /// Reject poisoned recordings (see #1857).
+    fn check_poisoned(node_info: &IntegrationTestInput) -> eyre::Result<()> {
         if let Some(boxed) = &node_info.recording_status
             && let RecordingStatus::Poisoned {
                 first_failure_event_index,
@@ -76,33 +115,7 @@ impl IntegrationTestingEvents {
                 node_id = node_info.id,
             );
         }
-
-        let output_writer = match output {
-            TestingOutput::ToFile(output_file_path) => {
-                let file = File::create(&output_file_path)
-                    .with_context(|| format!("failed to create {}", output_file_path.display()))?;
-                OutputWriter::Writer(Box::new(file))
-            }
-            TestingOutput::ToWriter(writer) => OutputWriter::Writer(writer),
-            TestingOutput::ToChannel(sender) => OutputWriter::Channel(sender),
-        };
-
-        node_info
-            .events
-            .as_mut_slice()
-            .sort_by(|a, b| a.time_offset_secs.total_cmp(&b.time_offset_secs));
-        let inputs = std::mem::take(&mut node_info.events).into_iter();
-
-        let clock = HLC::default();
-        let start_timestamp = clock.new_timestamp();
-        let start_time = Instant::now();
-        Ok(Self {
-            events: inputs,
-            output_writer,
-            start_timestamp,
-            start_time,
-            options,
-        })
+        Ok(())
     }
 
     pub fn request(&mut self, request: &Timestamped<DaemonRequest>) -> eyre::Result<DaemonReply> {
@@ -167,7 +180,7 @@ impl IntegrationTestingEvents {
             }
             OutputWriter::Channel(sender) => {
                 sender
-                    .send(output)
+                    .blocking_send(output)
                     .context("failed to send output to channel")?;
             }
         }
@@ -175,8 +188,20 @@ impl IntegrationTestingEvents {
     }
 
     fn next_event(&mut self) -> eyre::Result<Option<Timestamped<NodeEvent>>> {
-        let Some(event) = self.events.next() else {
-            return Ok(None);
+        let event = match &mut self.event_source {
+            EventSource::Vec(iter) => match iter.next() {
+                Some(e) => e,
+                None => return Ok(None),
+            },
+            // blocking_recv: tokio::sync::mpsc uses std::sync::Mutex internally
+            // instead of flume's spinlock, so parallel harness instances don't
+            // deadlock.  The channel disconnects when the harness drops its
+            // input_tx sender, causing blocking_recv() to return None.
+            // (See dora-rs/dora#1603 for the upstream flume->tokio migration.)
+            EventSource::Channel(rx) => match rx.blocking_recv() {
+                Some(e) => e,
+                None => return Ok(None),
+            },
         };
 
         let TimedIncomingEvent {
@@ -232,7 +257,7 @@ impl IntegrationTestingEvents {
 
 enum OutputWriter {
     Writer(Box<dyn Write + Send>),
-    Channel(flume::Sender<serde_json::Map<String, serde_json::Value>>),
+    Channel(tokio::sync::mpsc::Sender<serde_json::Map<String, serde_json::Value>>),
 }
 
 pub fn convert_output_to_json(

@@ -1782,7 +1782,7 @@ mod tests {
     fn test_node() -> (
         DoraNode,
         crate::EventStream,
-        flume::Receiver<serde_json::Map<String, serde_json::Value>>,
+        tokio::sync::mpsc::Receiver<serde_json::Map<String, serde_json::Value>>,
     ) {
         let events = vec![TimedIncomingEvent {
             time_offset_secs: 0.1,
@@ -1792,7 +1792,7 @@ mod tests {
             "test-node".parse().unwrap(),
             events,
         ));
-        let (tx, rx) = flume::unbounded();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let outputs = TestingOutput::ToChannel(tx);
         let options = TestingOptions {
             skip_output_time_offsets: true,
@@ -1815,7 +1815,7 @@ mod tests {
         // Output should have been sent to the channel
         drop(node);
         drop(events);
-        let outputs: Vec<_> = rx.try_iter().collect();
+        let outputs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0]["id"], "request");
     }
@@ -1852,7 +1852,7 @@ mod tests {
 
         drop(node);
         drop(events);
-        let outputs: Vec<_> = rx.try_iter().collect();
+        let outputs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0]["id"], "response");
     }
@@ -1984,7 +1984,7 @@ mod tests {
 
         drop(node);
         drop(events);
-        let outputs: Vec<_> = rx.try_iter().collect();
+        let outputs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0]["id"], "audio");
     }

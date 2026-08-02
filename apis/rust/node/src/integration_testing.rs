@@ -49,7 +49,7 @@
 //!    );
 //!
 //!    // send the node's outputs to a channel so we can verify them later
-//!    let (tx, rx) = flume::unbounded();
+//!    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 //!    let outputs = dora_node_api::integration_testing::TestingOutput::ToChannel(tx);
 //!
 //!    // don't include time offsets in the outputs to make them deterministic
@@ -65,7 +65,7 @@
 //!     crate::main()?;
 //!
 //!     // collect the nodes's outputs and compare them
-//!     let outputs = rx.try_iter().collect::<Vec<_>>();
+//!     let outputs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
 //!     assert_eq!(outputs, expected_outputs);
 //!
 //!     Ok(())
@@ -229,6 +229,17 @@ pub enum TestingInput {
     FromJsonFile(std::path::PathBuf),
     /// Directly provides the integration test input.
     Input(IntegrationTestInput),
+    /// Live channel for runtime event injection.
+    ///
+    /// Events are read from the channel on demand — the node blocks
+    /// until the test harness pushes a [`TimedIncomingEvent`] via
+    /// [`tokio::sync::mpsc::Sender::blocking_send`].  This enables
+    /// ergonomic `harness.send_input(…)`-style APIs without
+    /// pre-declaring all events at construction time.
+    ///
+    /// Uses [`tokio::sync::mpsc`] instead of `flume` to avoid the
+    /// spinlock deadlock described in dora-rs/dora#1603.
+    Channel(tokio::sync::mpsc::Receiver<integration_testing_format::TimedIncomingEvent>),
 }
 
 /// Specifies where to write the output data of an integration test.
@@ -266,10 +277,11 @@ pub enum TestingOutput {
     ToFile(std::path::PathBuf),
     /// Writes the output as JSONL file to the given writer.
     ToWriter(Box<dyn std::io::Write + Send>),
-    /// Sends each output as a JSON object to the given [`flume::Receiver`].
+    /// Sends each output as a JSON object to the given [`tokio::sync::mpsc::Sender`].
     ///
     /// Note: When using a bounded channel, the node may block when the channel is full.
-    ToChannel(flume::Sender<serde_json::Map<String, serde_json::Value>>),
+    /// Use [`tokio::sync::mpsc::blocking_send`] from a non-async context.
+    ToChannel(tokio::sync::mpsc::Sender<serde_json::Map<String, serde_json::Value>>),
 }
 
 /// Options for integration testing.
