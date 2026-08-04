@@ -262,6 +262,13 @@ impl ProcessHandle {
     pub fn submit(&self, operation: ProcessOperation) -> bool {
         self.op_tx.send(operation).is_ok()
     }
+
+    /// Returns `true` when the process-monitor task has exited (the
+    /// receiver half of the channel is gone), which means the child
+    /// process has died and its exit has been fully processed.
+    pub fn is_disconnected(&self) -> bool {
+        self.op_tx.is_disconnected()
+    }
 }
 
 impl Drop for ProcessHandle {
@@ -2058,5 +2065,19 @@ mod tests {
             new_rx.try_recv().is_err(),
             "kill from the previous incarnation must not reach the replacement process"
         );
+    }
+
+    /// BUG-004: `is_disconnected` must return `true` when the process
+    /// monitor task has exited (receiver dropped), so the startup
+    /// health check can release the barrier for dead unconnected nodes.
+    #[test]
+    fn process_handle_is_disconnected_after_receiver_drops() {
+        let (tx, rx) = flume::bounded::<ProcessOperation>(2);
+        let handle = ProcessHandle::new(tx);
+        // Still connected: receiver is alive
+        assert!(!handle.is_disconnected());
+        // Drop receiver → monitor task gone → disconnected
+        drop(rx);
+        assert!(handle.is_disconnected());
     }
 }

@@ -1766,7 +1766,7 @@ impl Daemon {
                     self.spawn_metrics_collection();
                 }
                 Event::NodeHealthCheckInterval => {
-                    self.check_node_health();
+                    self.check_node_health().await;
                     self.check_input_timeouts();
                     self.check_finish_stragglers();
                     if self.ft_stats.any_nonzero() {
@@ -3404,8 +3404,43 @@ impl Daemon {
         }
     }
 
-    fn check_node_health(&self) {
+    async fn check_node_health(&mut self) {
         let now_millis = node_communication::current_millis();
+
+        // Collect unconnected nodes whose process has died so the startup
+        // barrier can be released (BUG-004). A process crash before the
+        // node ever subscribes must not hang the dataflow forever.
+        let dead_before_subscribe: Vec<(uuid::Uuid, NodeId)> = {
+            let mut dead = Vec::new();
+            for (df_id, dataflow) in &self.running {
+                for (node_id, node) in &dataflow.running_nodes {
+                    let last = node.last_activity.load(atomic::Ordering::Acquire);
+                    if last == 0 && node.process.as_ref().is_some_and(|p| p.is_disconnected()) {
+                        dead.push((*df_id, node_id.clone()));
+                    }
+                }
+            }
+            dead
+        };
+
+        for (df_id, node_id) in &dead_before_subscribe {
+            tracing::warn!(
+                node_id = %node_id,
+                dataflow = %df_id,
+                "node process exited before subscribing; removing from startup barrier"
+            );
+            if let Err(e) = self
+                .handle_node_stop_inner(*df_id, node_id, false, false)
+                .await
+            {
+                tracing::error!(
+                    node_id = %node_id,
+                    error = %e,
+                    "failed to handle stopped node in startup health check"
+                );
+            }
+        }
+
         for dataflow in self.running.values() {
             for (node_id, node) in &dataflow.running_nodes {
                 let Some(timeout) = node.health_check_timeout else {
