@@ -1,0 +1,14 @@
+# dead-node-dataflow: 复现 BUG-004 启动屏障死进程
+# crash_node 用 `shell false` 立即退出且永不注册
+# 修复后: daemon 应检测到进程已死，释放 barrier
+# 修复前: barrier 永久等待
+nodes:
+  - id: crash_node
+    path: shell false
+    outputs:
+      - never_produced
+
+  - id: normal_node
+    path: shell true
+    inputs:
+      data: crash_node/never_produced

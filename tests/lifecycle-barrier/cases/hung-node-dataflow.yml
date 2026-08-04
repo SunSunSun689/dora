@@ -1,0 +1,14 @@
+# hung-node-dataflow: 复现 BUG-004 启动屏障无超时
+# hung_node 用 shell sleep 模拟"进程启动但永不注册"的场景
+# 预期: daemon 的 startup barrier 永远等不到 hung_node subscribe，
+# 所有已连接的 normal_node 在 init_from_env() 中卡住
+nodes:
+  - id: hung_node
+    path: shell sleep 999999
+    outputs:
+      - never_produced
+
+  - id: normal_node
+    path: normal.py
+    inputs:
+      data: hung_node/never_produced
