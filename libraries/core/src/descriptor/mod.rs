@@ -10,13 +10,14 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
+use tracing::warn;
 
 // reexport for compatibility
 pub use dora_message::descriptor::{
     CoreNodeKind, CustomNode, DYNAMIC_SOURCE, Descriptor, Node, OperatorConfig, OperatorDefinition,
-    OperatorSource, PythonSource, ResolvedNode, RmwZenohCompatibility, Ros2BridgeConfig,
-    Ros2Direction, Ros2QosConfig, Ros2TopicConfig, Ros2TransportConfig, RuntimeNode, SHELL_SOURCE,
-    SingleOperatorDefinition,
+    OperatorSource, PythonSource, ResolvedNode, RestartPolicy, RmwZenohCompatibility,
+    Ros2BridgeConfig, Ros2Direction, Ros2QosConfig, Ros2TopicConfig, Ros2TransportConfig,
+    RuntimeNode, SHELL_SOURCE, SingleOperatorDefinition,
 };
 pub use validate::ResolvedNodeExt;
 pub use visualize::collect_dora_timers;
@@ -89,70 +90,488 @@ fn prefix_output_with_operator_id(op_name: &OperatorId, output: &DataId) -> eyre
         })
 }
 
-impl DescriptorExt for Descriptor {
-    fn resolve_aliases_and_set_defaults(&self) -> eyre::Result<BTreeMap<NodeId, ResolvedNode>> {
-        let default_op_id = OperatorId::from(SINGLE_OPERATOR_DEFAULT_ID.to_string());
+/// Like [`DescriptorExt::resolve_aliases_and_set_defaults`], but resolves
+/// `desc` as a node (or nodes) being added to an already-running dataflow
+/// whose current node set is `topology_nodes`.
+///
+/// Whole-descriptor resolution rewrites an input that references a
+/// single-`operator:` producer from the bare output name to the
+/// operator-qualified one (`result` -> `op/result`). The dynamic-topology
+/// `AddNode` path resolves the new node in isolation, so that producer is not
+/// present in the descriptor being resolved and the rewrite is skipped —
+/// leaving the added node subscribed to an output name nobody publishes
+/// (silent data loss, #2877). Supplying the surrounding `topology_nodes` makes
+/// those producers visible so the prefixing is applied.
+///
+/// `topology_nodes` contribute *only* to the single-operator output-prefixing
+/// lookup — they are never themselves resolved or emitted, and nothing else on
+/// the surrounding descriptor (`env`, `deploy`, …) is consulted. Callers that
+/// want the running dataflow's `env` merged in must set it on `desc` (the
+/// `AddNode` handler does, see #2919). `desc`'s own nodes take precedence in
+/// the lookup, so a node id present in both resolves against the copy being
+/// added.
+pub fn resolve_aliases_and_set_defaults_in_topology(
+    desc: &Descriptor,
+    topology_nodes: &[Node],
+) -> eyre::Result<BTreeMap<NodeId, ResolvedNode>> {
+    let default_op_id = OperatorId::from(SINGLE_OPERATOR_DEFAULT_ID.to_string());
 
-        let single_operator_nodes: HashMap<_, _> = self
-            .nodes
-            .iter()
-            .filter_map(|n| {
-                n.operator
-                    .as_ref()
-                    .map(|op| (&n.id, op.id.as_ref().unwrap_or(&default_op_id)))
-            })
-            .collect();
+    let single_operator_nodes: HashMap<_, _> = topology_nodes
+        .iter()
+        .chain(desc.nodes.iter())
+        .filter_map(|n| {
+            n.operator
+                .as_ref()
+                .map(|op| (&n.id, op.id.as_ref().unwrap_or(&default_op_id)))
+        })
+        .collect();
 
-        let mut resolved = BTreeMap::new();
-        for mut node in self.nodes.clone() {
-            // adjust ROS2 bridge input mappings early (before node_kind borrows node)
-            if node.ros2.is_some() {
-                for input in node.inputs.values_mut() {
-                    if let InputMapping::User(m) = &mut input.mapping
-                        && let Some(op_name) = single_operator_nodes.get(&m.source).copied()
-                    {
-                        m.output = prefix_output_with_operator_id(op_name, &m.output)?;
-                    }
+    /// Check node-level fields that are silently dropped during resolution
+    /// for a given node kind. Rejects fields that do not belong to the kind
+    /// determined by `Node::kind()`.
+    fn validate_node_fields_for_kind(node: &Node) -> eyre::Result<()> {
+        let kind = node.kind()?;
+        let mut conflicts = Vec::new();
+
+        match kind {
+            NodeKind::Standard(_) => {
+                if node.hub.is_some() {
+                    conflicts.push("hub");
                 }
             }
+            NodeKind::Operator(_) | NodeKind::Runtime(_) => {
+                if node.path.is_some() {
+                    conflicts.push("path");
+                }
+                if node.path_sha256.is_some() {
+                    conflicts.push("path_sha256");
+                }
+                if node.git.is_some() {
+                    conflicts.push("git");
+                }
+                if node.hub.is_some() {
+                    conflicts.push("hub");
+                }
+                if node.branch.is_some() {
+                    conflicts.push("branch");
+                }
+                if node.tag.is_some() {
+                    conflicts.push("tag");
+                }
+                if node.rev.is_some() {
+                    conflicts.push("rev");
+                }
+                if node.build.is_some() {
+                    conflicts.push("build");
+                }
+                if node.args.is_some() {
+                    conflicts.push("args");
+                }
+                if node.send_stdout_as.is_some() {
+                    conflicts.push("send_stdout_as");
+                }
+                if node.send_logs_as.is_some() {
+                    conflicts.push("send_logs_as");
+                }
+                if node.min_log_level.is_some() {
+                    conflicts.push("min_log_level");
+                }
+                if node.max_log_size.is_some() {
+                    conflicts.push("max_log_size");
+                }
+                if node.max_rotated_files.is_some() {
+                    conflicts.push("max_rotated_files");
+                }
+                if !node.outputs.is_empty() {
+                    conflicts.push("outputs");
+                }
+                if !node.output_types.is_empty() {
+                    conflicts.push("output_types");
+                }
+                if !node.input_types.is_empty() {
+                    conflicts.push("input_types");
+                }
+                if !node.output_framing.is_empty() {
+                    conflicts.push("output_framing");
+                }
+                if !node.output_metadata.is_empty() {
+                    conflicts.push("output_metadata");
+                }
+                if node.pattern.is_some() {
+                    conflicts.push("pattern");
+                }
+                if !matches!(node.restart_policy, RestartPolicy::Never) {
+                    conflicts.push("restart_policy");
+                }
+                if node.max_restarts != 0 {
+                    conflicts.push("max_restarts");
+                }
+                if node.restart_delay.is_some() {
+                    conflicts.push("restart_delay");
+                }
+                if node.max_restart_delay.is_some() {
+                    conflicts.push("max_restart_delay");
+                }
+                if node.restart_window.is_some() {
+                    conflicts.push("restart_window");
+                }
+                if node.health_check_timeout.is_some() {
+                    conflicts.push("health_check_timeout");
+                }
+                if node.finish_grace_secs.is_some() {
+                    conflicts.push("finish_grace_secs");
+                }
+                if node.shared_memory_pool_size.is_some() {
+                    conflicts.push("shared_memory_pool_size");
+                }
+            }
+            NodeKind::Custom(_) => {
+                // Source-definition fields are mutually exclusive with
+                // `custom.source`. The rest are merged by
+                // `merge_node_level_fields_into_custom` and already reset.
+                if node.git.is_some() {
+                    conflicts.push("git");
+                }
+                if node.branch.is_some() {
+                    conflicts.push("branch");
+                }
+                if node.tag.is_some() {
+                    conflicts.push("tag");
+                }
+                if node.rev.is_some() {
+                    conflicts.push("rev");
+                }
+                if node.hub.is_some() {
+                    conflicts.push("hub");
+                }
+                // `pattern` and `output_metadata` have no counterpart in
+                // `CustomNode` / `NodeRunConfig` — they must stay inside
+                // `operator.config` or be used on a Standard node.
+                if !node.output_metadata.is_empty() {
+                    conflicts.push("output_metadata");
+                }
+                if node.pattern.is_some() {
+                    conflicts.push("pattern");
+                }
+            }
+            NodeKind::Module(_) => {
+                eyre::bail!(
+                    "module node `{}` must be expanded before resolution — call expand_modules() first",
+                    node.id
+                );
+            }
+            NodeKind::Ros2Bridge(_) => {
+                // Source-definition fields — ROS2 bridge is pre-built,
+                // these are silently dropped during resolution.
+                if node.git.is_some() {
+                    conflicts.push("git");
+                }
+                if node.branch.is_some() {
+                    conflicts.push("branch");
+                }
+                if node.tag.is_some() {
+                    conflicts.push("tag");
+                }
+                if node.rev.is_some() {
+                    conflicts.push("rev");
+                }
+                if node.hub.is_some() {
+                    conflicts.push("hub");
+                }
+                // No corresponding fields in the resolved CustomNode.
+                if !node.output_metadata.is_empty() {
+                    conflicts.push("output_metadata");
+                }
+                if node.pattern.is_some() {
+                    conflicts.push("pattern");
+                }
+            }
+        }
 
-            // adjust input mappings
-            let mut node_kind = node_kind_mut(&mut node)?;
-            let input_mappings: Vec<_> = match &mut node_kind {
-                NodeKindMut::Standard { inputs, .. } => inputs.values_mut().collect(),
-                NodeKindMut::Runtime(node) => node
-                    .operators
-                    .iter_mut()
-                    .flat_map(|op| op.config.inputs.values_mut())
-                    .collect(),
-                NodeKindMut::Custom(node) => node.run_config.inputs.values_mut().collect(),
-                NodeKindMut::Operator(operator) => operator.config.inputs.values_mut().collect(),
-                NodeKindMut::Ros2Bridge(_) => vec![],
-            };
-            for mapping in input_mappings
-                .into_iter()
-                .filter_map(|i| match &mut i.mapping {
-                    InputMapping::Timer { .. } | InputMapping::Logs(_) => None,
-                    InputMapping::User(m) => Some(m),
-                })
+        if !conflicts.is_empty() {
+            eyre::bail!(
+                "node `{}` has fields that are not supported on its node kind: {}\n\
+                 hint: these fields are silently dropped during resolution; \
+                 move them into the appropriate sub-configuration",
+                node.id,
+                conflicts.join(", ")
+            );
+        }
+        Ok(())
+    }
+
+    /// Merge Node-level fields into `CustomNode` for Custom-kind nodes.
+    ///
+    /// Standard nodes copy Node-level fields into their resolved `CustomNode`
+    /// during resolution (see the `NodeKindMut::Standard` arm). Custom nodes
+    /// previously skipped this step — when a user wrote fields like `outputs`
+    /// or `restart_policy` outside the `custom:` block they landed in `Node.*`
+    /// and were silently dropped (BUG-005).
+    ///
+    /// This function fills empty sub-structure fields from Node-level values,
+    /// with sub-structure values winning on conflict (they're more specific).
+    /// After the merge the Node-level fields are reset to their defaults so
+    /// downstream validation can still flag truly incompatible fields (`git`,
+    /// `hub`, etc.) without false-positives on now-merged fields.
+    fn merge_node_level_fields_into_custom(node: &mut Node) {
+        if let Some(ref mut custom) = node.custom {
+            let rc = &mut custom.run_config;
+            // Fields whose Node-level value was ignored because the
+            // sub-structure already had a (non-default) value set.
+            let mut shadowed = Vec::new();
+
+            // ── run_config fields ──
+            if rc.outputs.is_empty() && !node.outputs.is_empty() {
+                rc.outputs = std::mem::take(&mut node.outputs);
+            } else if !rc.outputs.is_empty() && !node.outputs.is_empty() {
+                shadowed.push("outputs");
+            }
+            if rc.inputs.is_empty() && !node.inputs.is_empty() {
+                rc.inputs = std::mem::take(&mut node.inputs);
+            } else if !rc.inputs.is_empty() && !node.inputs.is_empty() {
+                shadowed.push("inputs");
+            }
+            if rc.output_types.is_empty() && !node.output_types.is_empty() {
+                rc.output_types = std::mem::take(&mut node.output_types);
+            } else if !rc.output_types.is_empty() && !node.output_types.is_empty() {
+                shadowed.push("output_types");
+            }
+            if rc.output_framing.is_empty() && !node.output_framing.is_empty() {
+                rc.output_framing = std::mem::take(&mut node.output_framing);
+            } else if !rc.output_framing.is_empty() && !node.output_framing.is_empty() {
+                shadowed.push("output_framing");
+            }
+            if rc.input_types.is_empty() && !node.input_types.is_empty() {
+                rc.input_types = std::mem::take(&mut node.input_types);
+            } else if !rc.input_types.is_empty() && !node.input_types.is_empty() {
+                shadowed.push("input_types");
+            }
+            if rc.shared_memory_pool_size.is_none() && node.shared_memory_pool_size.is_some() {
+                rc.shared_memory_pool_size = node.shared_memory_pool_size.take();
+            } else if rc.shared_memory_pool_size.is_some() && node.shared_memory_pool_size.is_some()
             {
-                if let Some(op_name) = single_operator_nodes.get(&mapping.source).copied() {
-                    mapping.output = prefix_output_with_operator_id(op_name, &mapping.output)?;
-                }
+                shadowed.push("shared_memory_pool_size");
             }
 
-            // resolve nodes
-            let kind = match node_kind {
-                NodeKindMut::Standard {
-                    path,
-                    source,
-                    inputs: _,
-                } => CoreNodeKind::Custom(CustomNode {
-                    path: path.clone(),
-                    source,
-                    path_sha256: node.path_sha256,
+            // ── restart fields ──
+            //
+            // Note: `restart_policy` and `max_restarts` are non-Option types
+            // whose defaults (Never / 0) are indistinguishable from
+            // "explicitly set to default". If custom already has a non-default
+            // value we keep it; if both are set to the same non-default we
+            // silently skip the merge (the Node-level value is dropped).
+            // This is the same trade-off Standard nodes make when they always
+            // copy Node-level fields.
+            if matches!(custom.restart_policy, RestartPolicy::Never)
+                && !matches!(node.restart_policy, RestartPolicy::Never)
+            {
+                custom.restart_policy =
+                    std::mem::replace(&mut node.restart_policy, RestartPolicy::Never);
+            }
+            if custom.max_restarts == 0 && node.max_restarts != 0 {
+                custom.max_restarts = std::mem::replace(&mut node.max_restarts, 0);
+            }
+            if custom.restart_delay.is_none() && node.restart_delay.is_some() {
+                custom.restart_delay = node.restart_delay.take();
+            } else if custom.restart_delay.is_some() && node.restart_delay.is_some() {
+                shadowed.push("restart_delay");
+            }
+            if custom.max_restart_delay.is_none() && node.max_restart_delay.is_some() {
+                custom.max_restart_delay = node.max_restart_delay.take();
+            } else if custom.max_restart_delay.is_some() && node.max_restart_delay.is_some() {
+                shadowed.push("max_restart_delay");
+            }
+            if custom.restart_window.is_none() && node.restart_window.is_some() {
+                custom.restart_window = node.restart_window.take();
+            } else if custom.restart_window.is_some() && node.restart_window.is_some() {
+                shadowed.push("restart_window");
+            }
+
+            // ── runtime fields ──
+            if custom.health_check_timeout.is_none() && node.health_check_timeout.is_some() {
+                custom.health_check_timeout = node.health_check_timeout.take();
+            } else if custom.health_check_timeout.is_some() && node.health_check_timeout.is_some() {
+                shadowed.push("health_check_timeout");
+            }
+            if custom.finish_grace_secs.is_none() && node.finish_grace_secs.is_some() {
+                custom.finish_grace_secs = node.finish_grace_secs.take();
+            } else if custom.finish_grace_secs.is_some() && node.finish_grace_secs.is_some() {
+                shadowed.push("finish_grace_secs");
+            }
+
+            // ── build / execution fields ──
+            if custom.args.is_none() && node.args.is_some() {
+                custom.args = node.args.take();
+            } else if custom.args.is_some() && node.args.is_some() {
+                shadowed.push("args");
+            }
+            if custom.build.is_none() && node.build.is_some() {
+                custom.build = node.build.take();
+            } else if custom.build.is_some() && node.build.is_some() {
+                shadowed.push("build");
+            }
+            if custom.path_sha256.is_none() && node.path_sha256.is_some() {
+                custom.path_sha256 = node.path_sha256.take();
+            } else if custom.path_sha256.is_some() && node.path_sha256.is_some() {
+                shadowed.push("path_sha256");
+            }
+
+            // ── logging fields ──
+            if custom.send_stdout_as.is_none() && node.send_stdout_as.is_some() {
+                custom.send_stdout_as = node.send_stdout_as.take();
+            } else if custom.send_stdout_as.is_some() && node.send_stdout_as.is_some() {
+                shadowed.push("send_stdout_as");
+            }
+            if custom.send_logs_as.is_none() && node.send_logs_as.is_some() {
+                custom.send_logs_as = node.send_logs_as.take();
+            } else if custom.send_logs_as.is_some() && node.send_logs_as.is_some() {
+                shadowed.push("send_logs_as");
+            }
+            if custom.min_log_level.is_none() && node.min_log_level.is_some() {
+                custom.min_log_level = node.min_log_level.take();
+            } else if custom.min_log_level.is_some() && node.min_log_level.is_some() {
+                shadowed.push("min_log_level");
+            }
+            if custom.max_log_size.is_none() && node.max_log_size.is_some() {
+                custom.max_log_size = node.max_log_size.take();
+            } else if custom.max_log_size.is_some() && node.max_log_size.is_some() {
+                shadowed.push("max_log_size");
+            }
+            if custom.max_rotated_files.is_none() && node.max_rotated_files.is_some() {
+                custom.max_rotated_files = node.max_rotated_files.take();
+            } else if custom.max_rotated_files.is_some() && node.max_rotated_files.is_some() {
+                shadowed.push("max_rotated_files");
+            }
+
+            if !shadowed.is_empty() {
+                warn!(
+                    "node `{}`: the following fields are set at both the node level \
+                     and inside `custom:` — the `custom:` values take precedence: {}",
+                    node.id,
+                    shadowed.join(", ")
+                );
+            }
+        }
+    }
+
+    let mut resolved = BTreeMap::new();
+    for mut node in desc.nodes.clone() {
+        // Merge Node-level fields into CustomNode. Standard nodes do this
+        // during their →Custom conversion; Custom nodes previously skipped
+        // it, causing these fields to be silently dropped (BUG-005).
+        merge_node_level_fields_into_custom(&mut node);
+        // adjust ROS2 bridge input mappings early (before node_kind borrows node)
+        if node.ros2.is_some() {
+            let mut ros2_conflicts = Vec::new();
+            if node.build.is_some() {
+                ros2_conflicts.push("build");
+            }
+            if node.path_sha256.is_some() {
+                ros2_conflicts.push("path_sha256");
+            }
+            if !ros2_conflicts.is_empty() {
+                eyre::bail!(
+                    "node `{}` has `ros2` together with {}: these fields are not \
+                     supported on ROS2 bridge nodes — the bridge binary is pre-built",
+                    node.id,
+                    ros2_conflicts.join(", ")
+                );
+            }
+
+            for input in node.inputs.values_mut() {
+                if let InputMapping::User(m) = &mut input.mapping
+                    && let Some(op_name) = single_operator_nodes.get(&m.source).copied()
+                {
+                    m.output = prefix_output_with_operator_id(op_name, &m.output)?;
+                }
+            }
+        }
+
+        // adjust input mappings
+        validate_node_fields_for_kind(&node)?;
+
+        let mut node_kind = node_kind_mut(&mut node)?;
+        let input_mappings: Vec<_> = match &mut node_kind {
+            NodeKindMut::Standard { inputs, .. } => inputs.values_mut().collect(),
+            NodeKindMut::Runtime(node) => node
+                .operators
+                .iter_mut()
+                .flat_map(|op| op.config.inputs.values_mut())
+                .collect(),
+            NodeKindMut::Custom(node) => node.run_config.inputs.values_mut().collect(),
+            NodeKindMut::Operator(operator) => operator.config.inputs.values_mut().collect(),
+            NodeKindMut::Ros2Bridge(_) => vec![],
+        };
+        for mapping in input_mappings
+            .into_iter()
+            .filter_map(|i| match &mut i.mapping {
+                InputMapping::Timer { .. } | InputMapping::Logs(_) => None,
+                InputMapping::User(m) => Some(m),
+            })
+        {
+            if let Some(op_name) = single_operator_nodes.get(&mapping.source).copied() {
+                mapping.output = prefix_output_with_operator_id(op_name, &mapping.output)?;
+            }
+        }
+
+        // resolve nodes
+        let kind = match node_kind {
+            NodeKindMut::Standard {
+                path,
+                source,
+                inputs: _,
+            } => CoreNodeKind::Custom(CustomNode {
+                path: path.clone(),
+                source,
+                path_sha256: node.path_sha256,
+                args: node.args,
+                build: node.build,
+                send_stdout_as: node.send_stdout_as,
+                send_logs_as: node.send_logs_as,
+                min_log_level: node.min_log_level,
+                max_log_size: node.max_log_size,
+                max_rotated_files: node.max_rotated_files,
+                run_config: NodeRunConfig {
+                    inputs: node.inputs,
+                    outputs: node.outputs,
+                    output_types: node.output_types,
+                    output_framing: node.output_framing,
+                    input_types: node.input_types,
+                    shared_memory_pool_size: node.shared_memory_pool_size,
+                },
+                envs: None,
+                restart_policy: node.restart_policy,
+                max_restarts: node.max_restarts,
+                restart_delay: node.restart_delay,
+                max_restart_delay: node.max_restart_delay,
+                restart_window: node.restart_window,
+                health_check_timeout: node.health_check_timeout,
+                finish_grace_secs: node.finish_grace_secs,
+            }),
+            NodeKindMut::Custom(node) => CoreNodeKind::Custom(node.clone()),
+            NodeKindMut::Runtime(node) => CoreNodeKind::Runtime(node.clone()),
+            NodeKindMut::Operator(op) => CoreNodeKind::Runtime(RuntimeNode {
+                operators: vec![OperatorDefinition {
+                    id: op.id.clone().unwrap_or_else(|| default_op_id.clone()),
+                    config: op.config.clone(),
+                }],
+            }),
+            NodeKindMut::Ros2Bridge(config) => {
+                let bridge_config_json = serde_json::to_string(&config)
+                    .context("failed to serialize ROS2 bridge config")?;
+
+                let mut envs = BTreeMap::new();
+                envs.insert(
+                    "DORA_ROS2_BRIDGE_CONFIG".to_string(),
+                    EnvValue::String(bridge_config_json),
+                );
+
+                CoreNodeKind::Custom(CustomNode {
+                    path: "dora-ros2-bridge-node".to_string(),
+                    source: NodeSource::Local,
+                    path_sha256: None,
                     args: node.args,
-                    build: node.build,
+                    build: None,
                     send_stdout_as: node.send_stdout_as,
                     send_logs_as: node.send_logs_as,
                     min_log_level: node.min_log_level,
@@ -166,7 +585,7 @@ impl DescriptorExt for Descriptor {
                         input_types: node.input_types,
                         shared_memory_pool_size: node.shared_memory_pool_size,
                     },
-                    envs: None,
+                    envs: Some(envs),
                     restart_policy: node.restart_policy,
                     max_restarts: node.max_restarts,
                     restart_delay: node.restart_delay,
@@ -174,81 +593,40 @@ impl DescriptorExt for Descriptor {
                     restart_window: node.restart_window,
                     health_check_timeout: node.health_check_timeout,
                     finish_grace_secs: node.finish_grace_secs,
-                }),
-                NodeKindMut::Custom(node) => CoreNodeKind::Custom(node.clone()),
-                NodeKindMut::Runtime(node) => CoreNodeKind::Runtime(node.clone()),
-                NodeKindMut::Operator(op) => CoreNodeKind::Runtime(RuntimeNode {
-                    operators: vec![OperatorDefinition {
-                        id: op.id.clone().unwrap_or_else(|| default_op_id.clone()),
-                        config: op.config.clone(),
-                    }],
-                }),
-                NodeKindMut::Ros2Bridge(config) => {
-                    let bridge_config_json = serde_json::to_string(&config)
-                        .context("failed to serialize ROS2 bridge config")?;
-
-                    let mut envs = BTreeMap::new();
-                    envs.insert(
-                        "DORA_ROS2_BRIDGE_CONFIG".to_string(),
-                        EnvValue::String(bridge_config_json),
-                    );
-
-                    CoreNodeKind::Custom(CustomNode {
-                        path: "dora-ros2-bridge-node".to_string(),
-                        source: NodeSource::Local,
-                        path_sha256: None,
-                        args: node.args,
-                        build: None,
-                        send_stdout_as: node.send_stdout_as,
-                        send_logs_as: node.send_logs_as,
-                        min_log_level: node.min_log_level,
-                        max_log_size: node.max_log_size,
-                        max_rotated_files: node.max_rotated_files,
-                        run_config: NodeRunConfig {
-                            inputs: node.inputs,
-                            outputs: node.outputs,
-                            output_types: node.output_types,
-                            output_framing: node.output_framing,
-                            input_types: node.input_types,
-                            shared_memory_pool_size: node.shared_memory_pool_size,
-                        },
-                        envs: Some(envs),
-                        restart_policy: node.restart_policy,
-                        max_restarts: node.max_restarts,
-                        restart_delay: node.restart_delay,
-                        max_restart_delay: node.max_restart_delay,
-                        restart_window: node.restart_window,
-                        health_check_timeout: node.health_check_timeout,
-                        finish_grace_secs: node.finish_grace_secs,
-                    })
-                }
-            };
-
-            if resolved.contains_key(&node.id) {
-                eyre::bail!(
-                    "duplicate node ID `{}` — each node must have a unique `id`",
-                    node.id
-                );
+                })
             }
-            resolved.insert(
-                node.id.clone(),
-                ResolvedNode {
-                    id: node.id,
-                    name: node.name,
-                    description: node.description,
-                    // Merge the dataflow-level `env` into the per-node `env`.
-                    // Per-node keys win on conflict so a node can override a
-                    // shared default (e.g. global `RUST_LOG=info` with one
-                    // verbose node setting `RUST_LOG=debug`).
-                    env: merge_env(self.env.as_ref(), node.env),
-                    cpu_affinity: node.cpu_affinity,
-                    deploy: node.deploy,
-                    kind,
-                },
+        };
+
+        if resolved.contains_key(&node.id) {
+            eyre::bail!(
+                "duplicate node ID `{}` — each node must have a unique `id`",
+                node.id
             );
         }
+        resolved.insert(
+            node.id.clone(),
+            ResolvedNode {
+                id: node.id,
+                name: node.name,
+                description: node.description,
+                // Merge the dataflow-level `env` into the per-node `env`.
+                // Per-node keys win on conflict so a node can override a
+                // shared default (e.g. global `RUST_LOG=info` with one
+                // verbose node setting `RUST_LOG=debug`).
+                env: merge_env(desc.env.as_ref(), node.env),
+                cpu_affinity: node.cpu_affinity,
+                deploy: node.deploy,
+                kind,
+            },
+        );
+    }
 
-        Ok(resolved)
+    Ok(resolved)
+}
+
+impl DescriptorExt for Descriptor {
+    fn resolve_aliases_and_set_defaults(&self) -> eyre::Result<BTreeMap<NodeId, ResolvedNode>> {
+        resolve_aliases_and_set_defaults_in_topology(self, &[])
     }
 
     fn visualize_as_mermaid_with_boundaries(
@@ -707,6 +1085,129 @@ mod tests {
         assert_eq!(merged.get("A"), Some(&EnvValue::String("node".into())));
         assert_eq!(merged.get("B"), Some(&EnvValue::String("global".into())));
         assert_eq!(merged.get("C"), Some(&EnvValue::String("node".into())));
+    }
+
+    fn resolved_input_mapping<'a>(
+        resolved: &'a BTreeMap<NodeId, ResolvedNode>,
+        node: &str,
+        input: &str,
+    ) -> &'a InputMapping {
+        let node = resolved
+            .get(&NodeId::from(node.to_string()))
+            .expect("node resolved");
+        let inputs = match &node.kind {
+            CoreNodeKind::Custom(n) => &n.run_config.inputs,
+            CoreNodeKind::Runtime(_) => panic!("expected custom node"),
+        };
+        &inputs
+            .get(&DataId::from(input.to_string()))
+            .expect("input present")
+            .mapping
+    }
+
+    #[test]
+    fn add_node_prefixes_single_operator_producer_input_via_topology() {
+        // A node added to a running dataflow via `AddNode` is resolved against a
+        // single-node descriptor. If its input references an existing
+        // single-`operator:` producer, the `op/` output prefix that
+        // whole-descriptor resolution applies must still be added — sourced
+        // from the surrounding topology — or the node subscribes to an output
+        // name nobody publishes and silently receives no data (#2877).
+        let topology: Descriptor = serde_yaml::from_str(
+            "\
+nodes:
+  - id: producer
+    operator:
+      python: producer.py
+      outputs:
+        - result
+",
+        )
+        .expect("parse topology");
+
+        let added: Descriptor = serde_yaml::from_str(
+            "\
+nodes:
+  - id: consumer
+    path: consumer
+    inputs:
+      reading: producer/result
+",
+        )
+        .expect("parse added node");
+
+        // With the topology the input is prefixed to the operator-qualified
+        // output name the runtime actually publishes under (`op/result`).
+        let resolved = resolve_aliases_and_set_defaults_in_topology(&added, &topology.nodes)
+            .expect("resolve in topology");
+        match resolved_input_mapping(&resolved, "consumer", "reading") {
+            InputMapping::User(m) => {
+                assert_eq!(m.source, NodeId::from("producer".to_string()));
+                assert_eq!(m.output, DataId::from("op/result".to_string()));
+            }
+            other => panic!("expected user mapping, got {other:?}"),
+        }
+
+        // Contrast: with no topology the producer is not in scope at all, so
+        // there is nothing to key the rewrite off and the name stays bare.
+        // That is the correct answer for the inputs given — which is exactly
+        // why the `AddNode` path had to stop resolving in isolation.
+        let resolved_isolated = added
+            .resolve_aliases_and_set_defaults()
+            .expect("resolve isolated");
+        match resolved_input_mapping(&resolved_isolated, "consumer", "reading") {
+            InputMapping::User(m) => {
+                assert_eq!(m.output, DataId::from("result".to_string()));
+            }
+            other => panic!("expected user mapping, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn topology_lookup_prefers_the_node_being_added_over_a_same_id_topology_entry() {
+        // The lookup chains topology nodes *before* `desc`'s own, so a node id
+        // present in both resolves against the copy being added rather than a
+        // stale topology entry. Unreachable through `AddNode` today (duplicate
+        // ids are rejected up front and `RemoveNode` prunes the stored
+        // descriptor), but the precedence should not depend on that.
+        let topology: Descriptor = serde_yaml::from_str(
+            "\
+nodes:
+  - id: producer
+    operator:
+      id: stale
+      python: producer.py
+      outputs:
+        - result
+",
+        )
+        .expect("parse topology");
+
+        let added: Descriptor = serde_yaml::from_str(
+            "\
+nodes:
+  - id: producer
+    operator:
+      id: fresh
+      python: producer.py
+      outputs:
+        - result
+  - id: consumer
+    path: consumer
+    inputs:
+      reading: producer/result
+",
+        )
+        .expect("parse added nodes");
+
+        let resolved = resolve_aliases_and_set_defaults_in_topology(&added, &topology.nodes)
+            .expect("resolve in topology");
+        match resolved_input_mapping(&resolved, "consumer", "reading") {
+            InputMapping::User(m) => {
+                assert_eq!(m.output, DataId::from("fresh/result".to_string()));
+            }
+            other => panic!("expected user mapping, got {other:?}"),
+        }
     }
 
     #[test]
