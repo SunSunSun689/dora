@@ -107,6 +107,40 @@ impl DescriptorExt for Descriptor {
         for mut node in self.nodes.clone() {
             // adjust ROS2 bridge input mappings early (before node_kind borrows node)
             if node.ros2.is_some() {
+                // Reject fields that are silently dropped during ROS2 bridge
+                // resolution (git/branch/tag/rev/hub/output_metadata/pattern).
+                let mut ros2_conflicts = Vec::new();
+                if node.git.is_some() {
+                    ros2_conflicts.push("git");
+                }
+                if node.branch.is_some() {
+                    ros2_conflicts.push("branch");
+                }
+                if node.tag.is_some() {
+                    ros2_conflicts.push("tag");
+                }
+                if node.rev.is_some() {
+                    ros2_conflicts.push("rev");
+                }
+                if node.hub.is_some() {
+                    ros2_conflicts.push("hub");
+                }
+                if !node.output_metadata.is_empty() {
+                    ros2_conflicts.push("output_metadata");
+                }
+                if node.pattern.is_some() {
+                    ros2_conflicts.push("pattern");
+                }
+                if !ros2_conflicts.is_empty() {
+                    eyre::bail!(
+                        "node `{}` has fields that are not supported on ROS2 bridge nodes: {}\n\
+                         hint: these fields are silently dropped during resolution; \
+                         remove them from the ROS2 bridge node",
+                        node.id,
+                        ros2_conflicts.join(", ")
+                    );
+                }
+
                 for input in node.inputs.values_mut() {
                     if let InputMapping::User(m) = &mut input.mapping
                         && let Some(op_name) = single_operator_nodes.get(&m.source).copied()
