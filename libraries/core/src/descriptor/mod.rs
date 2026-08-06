@@ -109,28 +109,20 @@ impl DescriptorExt for Descriptor {
             if node.ros2.is_some() {
                 // Reject fields that are silently dropped during ROS2 bridge
                 // resolution (git/branch/tag/rev/hub/output_metadata/pattern).
-                let mut ros2_conflicts = Vec::new();
-                if node.git.is_some() {
-                    ros2_conflicts.push("git");
-                }
-                if node.branch.is_some() {
-                    ros2_conflicts.push("branch");
-                }
-                if node.tag.is_some() {
-                    ros2_conflicts.push("tag");
-                }
-                if node.rev.is_some() {
-                    ros2_conflicts.push("rev");
-                }
-                if node.hub.is_some() {
-                    ros2_conflicts.push("hub");
-                }
-                if !node.output_metadata.is_empty() {
-                    ros2_conflicts.push("output_metadata");
-                }
-                if node.pattern.is_some() {
-                    ros2_conflicts.push("pattern");
-                }
+                let ros2_conflicts: Vec<&str> = [
+                    ("git", node.git.is_some()),
+                    ("branch", node.branch.is_some()),
+                    ("tag", node.tag.is_some()),
+                    ("rev", node.rev.is_some()),
+                    ("hub", node.hub.is_some()),
+                    ("output_metadata", !node.output_metadata.is_empty()),
+                    ("pattern", node.pattern.is_some()),
+                ]
+                .into_iter()
+                .filter(|(_, set)| *set)
+                .map(|(name, _)| name)
+                .collect();
+
                 if !ros2_conflicts.is_empty() {
                     eyre::bail!(
                         "node `{}` has fields that are not supported on ROS2 bridge nodes: {}\n\
