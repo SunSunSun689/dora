@@ -159,7 +159,7 @@ The deeper QA gates — `make qa-full`, `make qa-deep`, `make qa-nightly`, `make
 
 - `make qa-full` (qa-fast + full tests + coverage) — ~5-10 minutes. Run before a significant push if you want extra confidence; coverage is too slow for every push.
 - `make qa-deep` (qa-full + mutation testing + semver) — ~15 minutes. The **target** Tier 1 local gate. Today's CI PR gate only runs the fast subset (fmt/clippy/typos/audit/unwrap-budget + tests); `qa-deep` adds coverage, adversarial review, diff-scoped mutation, and semver — kept laptop-only because they're too slow for every PR (see `docs/plan-agentic-qa-strategy.md` §5). Alias: `make qa-tier1`, kept for back-compat.
-- `make qa-nightly` (qa-deep + proptest@1000 + miri + example-smoke + ci-nightly-jobs) — ~3-4 hours. **Full parity with `.github/workflows/nightly.yml`** (#1707, #1710, #1716). After the #1716 rebalance (plus cluster-record-replay from #2013 and memory-pool-smoke from #2302), nightly.yml has **22 test jobs**. example-smoke covers the **4 example-backed** jobs (smoke-suite, log-sinks, service-action, streaming); `scripts/qa/ci-nightly-jobs.sh` drives the **17 remaining** with platform-aware dispatch (record-replay, cluster-smoke, cluster-e2e [Linux, needs `openssh-server`], cluster-record-replay [Linux, needs `openssh-server`], topic-and-top, cpu-affinity [Linux], redb-backend, daemon-reconnect [Linux], state-reconstruction, test-cross-platform [macOS+Windows], examples, cli-tests, bench-example, cross-check, ros2-bridge [Linux, basic checks — no ROS distro], msrv, kani-proofs [skipped if Kani not installed]). The **22nd**, `memory-pool-smoke` (the torch-gated `#[ignore]` memory-pool example tests run with `--ignored`), is covered locally by `make qa-examples` / `scripts/smoke-all.sh`, **not** the qa-nightly example-smoke step (which skips `#[ignore]` tests). A green local `qa-nightly` on platform X predicts a green CI nightly for platform X's jobs. **Requires both `uv` and Python 3.12** (both preflighted; the script fails fast with a specific install hint for whichever is missing — `curl -LsSf https://astral.sh/uv/install.sh \| sh` for uv, `uv python install 3.12` for the interpreter, matching the GHA `actions/setup-python` step at `.github/workflows/nightly.yml:56`). example-smoke creates a scratch venv at `target/qa-nightly-venv` and installs `-e apis/python/node` into it so Python nodes use the workspace bindings (not PyPI `dora-rs`, whose message format has drifted from the workspace — #1710). The CI-jobs script installs the CLI into a scratch dir (won't clobber `~/.cargo/bin/dora`) and bails if port 6013 is in use; cpu-affinity + daemon-reconnect skip on non-Linux. Skips miri if `cargo +nightly miri` isn't installed. **Does not** include full-repo mutation testing — that's split into `qa-mutation-audit` because it takes 10-18 hours on this workspace.
+- `make qa-nightly` (qa-deep + proptest@1000 + miri + example-smoke + ci-nightly-jobs) — ~3-4 hours. **Full parity with `.github/workflows/nightly.yml`** (#1707, #1710, #1716). After the #1716 rebalance (plus cluster-record-replay from #2013 and memory-pool-smoke from #2302), nightly.yml has **27 test jobs** (`cli-tests` was split into `cli-tests` + `cli-tests-python` in #2742; re-counted in #2999, where the previous 23 counted neither `hub-smoke` nor the two `ros2-zenoh-*` jobs, and `multi-daemon-late-subscriber` is new). example-smoke covers the **4 example-backed** jobs (smoke-suite, log-sinks, service-action, streaming); `scripts/qa/ci-nightly-jobs.sh` drives **20** with platform-aware dispatch (record-replay, cluster-smoke, cluster-e2e [Linux, needs `openssh-server`], cluster-record-replay [Linux, needs `openssh-server`], topic-and-top, cpu-affinity [Linux], redb-backend, daemon-reconnect [Linux], state-reconstruction, multi-daemon-late-subscriber [Linux], test-cross-platform [macOS+Windows], examples, cli-tests **and cli-tests-python** — one local `cli-tests` invocation covers both halves, bench-example, cross-check, ros2-bridge [Linux, basic checks — no ROS distro], ros2-zenoh-humble, ros2-zenoh-kilted, msrv, kani-proofs [skipped if Kani not installed]). Of the rest, `memory-pool-smoke` (the torch-gated `#[ignore]` memory-pool example tests run with `--ignored`), is covered locally by `make qa-examples` / `scripts/smoke-all.sh`, **not** the qa-nightly example-smoke step (which skips `#[ignore]` tests), and `hub-smoke` has no local driver entry at all. A green local `qa-nightly` on platform X predicts a green CI nightly for platform X's jobs. **Requires both `uv` and Python 3.12** (both preflighted; the script fails fast with a specific install hint for whichever is missing — `curl -LsSf https://astral.sh/uv/install.sh \| sh` for uv, `uv python install 3.12` for the interpreter, matching the GHA `actions/setup-python` step at `.github/workflows/nightly.yml:56`). example-smoke creates a scratch venv at `target/qa-nightly-venv` and installs `-e apis/python/node` into it so Python nodes use the workspace bindings (not PyPI `dora-rs`, whose message format has drifted from the workspace — #1710). The CI-jobs script installs the CLI into a scratch dir (won't clobber `~/.cargo/bin/dora`) and bails if port 6013 is in use; cpu-affinity + daemon-reconnect skip on non-Linux. Skips miri if `cargo +nightly miri` isn't installed. **Does not** include full-repo mutation testing — that's split into `qa-mutation-audit` because it takes 10-18 hours on this workspace.
 - `make qa-release-gate` (qa-deep + semver) — the automatable subset of Tier 3. The non-automatable parts (independent security audit, dogfood campaign, migration validation) are documented in `docs/plan-agentic-qa-strategy.md` §7 but not locally gateable.
 - `make qa-mutation-audit` — ~10-18 hours. Full-repo `cargo-mutants` across 6 critical crates. Deliberate test-quality audit; run before a release or when investigating a specific crate, not every nightly.
 - `make qa-examples` — ~15-20 min. Runs all **smoke-eligible** example dataflows end-to-end via `scripts/smoke-all.sh`. Skips examples that need CUDA, ROS2, webcam, multi-machine deploy, C/C++ toolchains, or interactive CLI (run `scripts/smoke-all.sh -h` to see the SKIP list). Orthogonal to the qa-fast/full/deep ladder: those targets `--exclude dora-examples` to keep per-commit / pre-push budgets tight. Run this when you want actual dataflows exercised (after touching node/operator APIs, CLI subcommands, or the descriptor surface). Pass flags via `ARGS`, e.g. `make qa-examples ARGS="--rust-only"` or `make qa-examples ARGS="-v"`.
@@ -216,6 +216,35 @@ All new features and bug fixes must follow the RED-GREEN-IMPROVE cycle:
 | New dataflow feature | Smoke test (both modes) | `tests/example-smoke.rs` using both `run_smoke_test()` and `run_smoke_test_local()` |
 | Bug fix | Regression test | Whichever tier reproduces the bug |
 | New example dataflow | Smoke test entry | Add to `tests/example-smoke.rs` and `scripts/smoke-all.sh` |
+| **Descriptor field validation** | **Cross-kind test first** | **`tests/descriptor-validation.rs` — see rule below** |
+
+### Descriptor field validation: cross-kind rule
+
+When adding a deny-list check that rejects field X on node kind K, the RED phase MUST include two tests:
+
+1. **Rejection test**: Field X on kind K → fails with "not supported"
+2. **Acceptance test**: Field X on every OTHER kind where it IS legal → passes
+
+Example (BUG-005 lesson):
+
+```rust
+// ❌ WRONG — only tested rejection, missed the regression
+#[test]
+fn invalid_standard_rejects_pattern() {
+    descriptor_should_fail("...", &["pattern", "not supported"]);
+}
+
+// ✅ RIGHT — also verify Standard accepts it
+#[test]
+fn valid_standard_accepts_pattern() {
+    descriptor_should_pass("standard-with-pattern.yml");
+}
+```
+
+Before adding a field to any deny-list, trace its consumers in the codebase
+(e.g. `grep -r 'node\.pattern\|\.output_metadata' libraries/core/src/`)
+to confirm it is genuinely unused by that node kind. A field that appears
+only in sub-struct validation is NOT safe to deny-list at the Node level.
 
 ### Workflow
 
@@ -233,6 +262,20 @@ cargo fmt --all -- --check
 
 # 4. Run smoke tests if the change touches CLI/coordinator/daemon
 cargo test --test example-smoke -- --test-threads=1
+```
+
+### After each bug fix: record progress + clean up
+
+```bash
+# 1. Write progress to memory (required)
+#    Create / update  .claude/projects/<repo>/memory/<bug-slug>.md
+#    with: status, root cause, fix approach, affected files, PR link.
+#    Then add an entry to MEMORY.md.
+
+# 2. Clean build artifacts (required)
+#    target/  grows rapidly during feature work — clean it before
+#    moving to the next task to free disk space.
+cargo clean
 ```
 
 ### Smoke test patterns
